@@ -32,6 +32,7 @@ SAGE combines:
   - [Simulation Execution](#simulation-execution)
   - [Data Analysis](#data-analysis)
   - [Real Robot Integration](#real-robot-integration)
+- [Starting from Real Data](#starting-from-real-data)
 - [OSMO Workflow](#osmo-workflow)
 - [Data Format](#data-format)
   - [Motion Files](#motion-files)
@@ -183,6 +184,47 @@ For detailed setup instructions, usage examples, and robot-specific configuratio
 - [UNITREE_REAL](docs/UNITREE_REAL.md) - Unitree G1 and H1-2 guide
 - [REALMAN_REAL](docs/REALMAN_REAL.md) - Realman WR75S guide
 - [LEROBOT_REAL](docs/LEROBOT_REAL.md) - LeRobot SO-101 guide
+
+## Starting from Real Data
+
+If you already have real robot data and want to measure the sim2real gap, follow these steps.
+
+### 1. Prepare Digital Assets
+
+Convert your robot model to USD format and register it in SAGE. Refer to [Adding New Humanoids](#adding-new-humanoids) for the full walkthrough. Skip this step if your robot is already supported.
+
+Required outputs:
+- `assets/{robot_name}/{robot}.usd` — robot USD asset
+- `configs/{robot_name}_valid_joints.txt` — joints to evaluate
+
+### 2. Configure Simulation Parameters
+
+In `sage/assets.py`, set `default_kp`, `default_kd`, and `default_control_freq` to match the controller settings used during real data collection. Mismatched parameters will inflate the measured gap.
+
+```python
+"{robot_name}": {
+    "usd_path": "assets/{robot_name}/{robot}.usd",
+    "offset": (0.0, 0.0, <z_offset>),
+    "default_kp": <kp>,
+    "default_kd": <kd>,
+    "default_control_freq": <hz>,
+}
+```
+
+### 3. Prepare Real Data
+
+Convert your real recordings into the two formats SAGE expects:
+
+- **Motion files** (input to simulation): extract command trajectories from your recordings and convert to motion file format (see [Motion Files](#motion-files)). Place them under `motion_files/{robot_name}/{source}/`.
+- **Real output** (input to analysis): convert your recorded joint states to SAGE's real output format (see [Real Robot Output](#real-robot-output)). Place them under `output/real/{robot_name}/{source}/{motion_name}/`.
+
+### 4. Run Simulation
+
+Use `scripts/run_simulation.py` to replay the motion files in Isaac Sim. Output is written to `output/sim/{robot_name}/{source}/`.
+
+### 5. Analyze Sim2Real Gap
+
+With both `output/real/` and `output/sim/` populated, use `scripts/run_analysis.py` to generate per-joint metrics (RMSE, MAPE, correlation, cosine similarity) and visualization plots.
 
 ## OSMO Workflow
 
