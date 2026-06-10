@@ -9,11 +9,10 @@
 import argparse
 import glob
 import os
+import sys
 import time
 
-from sage.real_realman.realman_collector import realman_collector_main
-from sage.real_so101.so101_lerobot_collector import so101_collector_main
-from sage.real_unitree.unitree_collector import unitree_collector_main
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 REST_PERIOD_SECONDS = 15
 
@@ -27,13 +26,32 @@ def run_motion(
     robot_port=None,
     robot_type=None,
     robot_id=None,
+    flexiv_robot_sn=None,
+    flexiv_joint_group=None,
+    flexiv_dry_run=False,
+    flexiv_control_freq=50,
+    flexiv_slowdown_factor=1.0,
+    flexiv_max_velocity=0.05,
+    flexiv_max_acceleration=0.1,
+    flexiv_home_plan=None,
+    flexiv_start_move_duration=20.0,
+    flexiv_start_max_velocity=0.03,
+    flexiv_start_max_acceleration=0.05,
+    flexiv_motion_scale=1.0,
+    flexiv_max_initial_diff_rad=0.5,
 ):
     """Run a single motion file for the specified robot."""
     if robot_name == "h12" or robot_name == "g1":
+        from sage.real_unitree.unitree_collector import unitree_collector_main
+
         unitree_collector_main(robot_name, motion_file, output_dir)
     elif robot_name == "realman":
+        from sage.real_realman.realman_collector import realman_collector_main
+
         realman_collector_main(motion_file, output_dir)
     elif robot_name == "so101":
+        from sage.real_so101.so101_lerobot_collector import so101_collector_main
+
         so101_collector_main(
             motion_file,
             output_dir,
@@ -43,6 +61,30 @@ def run_motion(
             auto_start=auto_start,
             motion_name=motion_name,
         )
+    elif robot_name == "flexiv":
+        from sage.real_flexiv.flexiv_collector import flexiv_collector_main
+
+        flexiv_collector_main(
+            motion_file,
+            output_dir,
+            robot_sn=flexiv_robot_sn,
+            joint_group=flexiv_joint_group,
+            control_freq=flexiv_control_freq,
+            slowdown_factor=flexiv_slowdown_factor,
+            auto_start=auto_start,
+            motion_name=motion_name,
+            dry_run=flexiv_dry_run,
+            max_velocity=flexiv_max_velocity,
+            max_acceleration=flexiv_max_acceleration,
+            home_plan=flexiv_home_plan,
+            start_move_duration=flexiv_start_move_duration,
+            start_max_velocity=flexiv_start_max_velocity,
+            start_max_acceleration=flexiv_start_max_acceleration,
+            motion_scale=flexiv_motion_scale,
+            max_initial_diff_rad=flexiv_max_initial_diff_rad,
+        )
+    else:
+        raise ValueError(f"Unknown robot name: {robot_name}")
 
 
 if __name__ == "__main__":
@@ -59,7 +101,11 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--robot-name", action="store", type=str, help="Robot name: realman, h12, g1, or so101", required=True
+        "--robot-name",
+        action="store",
+        type=str,
+        help="Robot name: realman, h12, g1, so101, or flexiv",
+        required=True,
     )
     parser.add_argument(
         "--motion-files",
@@ -107,7 +153,91 @@ Examples:
         default="my_awesome_follower_arm",
         help="Robot ID for SO-101 (default: my_awesome_follower_arm)",
     )
+    # Flexiv specific arguments
+    parser.add_argument(
+        "--flexiv-robot-sn",
+        type=str,
+        default=None,
+        help="Flexiv robot serial number, e.g. Rizon4s-123456",
+    )
+    parser.add_argument(
+        "--flexiv-joint-group",
+        type=str,
+        default=None,
+        help="Flexiv joint group to control (ARMS, ARM_1, or ARM_2). Defaults to the first available group.",
+    )
+    parser.add_argument(
+        "--flexiv-dry-run",
+        action="store_true",
+        help="Generate Flexiv SAGE CSV output without connecting to hardware.",
+    )
+    parser.add_argument(
+        "--flexiv-control-freq",
+        type=int,
+        default=50,
+        help="Flexiv non-real-time joint command frequency in Hz, 1-100 recommended by RDK.",
+    )
+    parser.add_argument(
+        "--flexiv-slowdown-factor",
+        type=float,
+        default=1.0,
+        help="Slow down Flexiv playback by this factor.",
+    )
+    parser.add_argument(
+        "--flexiv-max-velocity",
+        type=float,
+        default=0.05,
+        help="Flexiv NrtJointPositionCmd dq_max per joint in rad/s.",
+    )
+    parser.add_argument(
+        "--flexiv-max-acceleration",
+        type=float,
+        default=0.1,
+        help="Flexiv NrtJointPositionCmd ddq_max per joint in rad/s^2.",
+    )
+    parser.add_argument(
+        "--flexiv-home-plan",
+        type=str,
+        default=None,
+        help="Optional Flexiv plan to execute before collection, e.g. PLAN-Home.",
+    )
+    parser.add_argument(
+        "--flexiv-start-move-duration",
+        type=float,
+        default=20.0,
+        help="Seconds used to move smoothly to the first Flexiv motion waypoint.",
+    )
+    parser.add_argument(
+        "--flexiv-start-max-velocity",
+        type=float,
+        default=0.03,
+        help="Flexiv dq_max used only while moving to the first waypoint, in rad/s.",
+    )
+    parser.add_argument(
+        "--flexiv-start-max-acceleration",
+        type=float,
+        default=0.05,
+        help="Flexiv ddq_max used only while moving to the first waypoint, in rad/s^2.",
+    )
+    parser.add_argument(
+        "--flexiv-motion-scale",
+        type=float,
+        default=1.0,
+        help="Scale motion deviations from the first waypoint. Use 0.1 for 10 percent amplitude.",
+    )
+    parser.add_argument(
+        "--flexiv-max-initial-diff-rad",
+        type=float,
+        default=0.5,
+        help="Prompt if any Flexiv joint must move farther than this to reach the first waypoint.",
+    )
     args = parser.parse_args()
+
+    if args.robot_name == "flexiv":
+        if not args.flexiv_dry_run and not args.flexiv_robot_sn:
+            parser.error("--flexiv-robot-sn is required for Flexiv hardware collection unless --flexiv-dry-run is set")
+        if args.flexiv_control_freq < 1 or args.flexiv_control_freq > 100:
+            parser.error("--flexiv-control-freq must be in the RDK-supported 1-100 Hz range")
 
     # Validate that at least one motion source is provided
     if not args.motion_files and not args.motion_folder:
@@ -186,6 +316,19 @@ Examples:
                 robot_port=args.robot_port,
                 robot_type=args.robot_type,
                 robot_id=args.robot_id,
+                flexiv_robot_sn=args.flexiv_robot_sn,
+                flexiv_joint_group=args.flexiv_joint_group,
+                flexiv_dry_run=args.flexiv_dry_run,
+                flexiv_control_freq=args.flexiv_control_freq,
+                flexiv_slowdown_factor=args.flexiv_slowdown_factor,
+                flexiv_max_velocity=args.flexiv_max_velocity,
+                flexiv_max_acceleration=args.flexiv_max_acceleration,
+                flexiv_home_plan=args.flexiv_home_plan,
+                flexiv_start_move_duration=args.flexiv_start_move_duration,
+                flexiv_start_max_velocity=args.flexiv_start_max_velocity,
+                flexiv_start_max_acceleration=args.flexiv_start_max_acceleration,
+                flexiv_motion_scale=args.flexiv_motion_scale,
+                flexiv_max_initial_diff_rad=args.flexiv_max_initial_diff_rad,
             )
 
             # Rest period between runs (skip after the last run)

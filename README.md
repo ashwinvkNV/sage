@@ -169,6 +169,7 @@ python scripts/run_analysis.py \
 - **Unitree G1** and **H1-2** humanoid robots
 - **Realman WR75S** dual-arm robot
 - **LeRobot SO-101** follower arm
+- **Flexiv** Rizon-style arms through Flexiv RDK
 
 Use the unified script to collect motion data on real robots (with custom robot-specific parameters):
 
@@ -184,6 +185,7 @@ For detailed setup instructions, usage examples, and robot-specific configuratio
 - [UNITREE_REAL](docs/UNITREE_REAL.md) - Unitree G1 and H1-2 guide
 - [REALMAN_REAL](docs/REALMAN_REAL.md) - Realman WR75S guide
 - [LEROBOT_REAL](docs/LEROBOT_REAL.md) - LeRobot SO-101 guide
+- [FLEXIV_REAL](docs/FLEXIV_REAL.md) - Flexiv RDK guide
 
 ## Starting from Real Data
 
