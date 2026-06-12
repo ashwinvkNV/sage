@@ -17,6 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REST_PERIOD_SECONDS = 15
 
 
+def format_scalar_for_name(value):
+    """Format a scalar for filesystem-safe Flexiv sweep suffixes."""
+    return f"{value:g}".replace("-", "m").replace(".", "p")
+
+
 def run_motion(
     robot_name,
     motion_file,
@@ -39,6 +44,9 @@ def run_motion(
     flexiv_start_max_acceleration=0.05,
     flexiv_motion_scale=1.0,
     flexiv_max_initial_diff_rad=0.5,
+    flexiv_control_mode="nrt_joint_impedance",
+    flexiv_stiffness_scale=1.0,
+    flexiv_damping_ratio=0.7,
 ):
     """Run a single motion file for the specified robot."""
     if robot_name == "h12" or robot_name == "g1":
@@ -82,6 +90,9 @@ def run_motion(
             start_max_acceleration=flexiv_start_max_acceleration,
             motion_scale=flexiv_motion_scale,
             max_initial_diff_rad=flexiv_max_initial_diff_rad,
+            control_mode=flexiv_control_mode,
+            stiffness_scale=flexiv_stiffness_scale,
+            damping_ratio=flexiv_damping_ratio,
         )
     else:
         raise ValueError(f"Unknown robot name: {robot_name}")
@@ -231,6 +242,30 @@ Examples:
         default=0.5,
         help="Prompt if any Flexiv joint must move farther than this to reach the first waypoint.",
     )
+    parser.add_argument(
+        "--flexiv-control-mode",
+        type=str,
+        choices=["nrt_joint_impedance", "nrt_joint_position"],
+        default="nrt_joint_impedance",
+        help="Flexiv joint controller mode. Use nrt_joint_impedance to compare against joint impedance.",
+    )
+    parser.add_argument(
+        "--flexiv-stiffness-scales",
+        type=float,
+        nargs="+",
+        default=[1.0],
+        help=(
+            "One or more Flexiv joint impedance stiffness scales in [0, 1], applied to robot.info().K_q_nom. "
+            "Multiple values create a sweep."
+        ),
+    )
+    parser.add_argument(
+        "--flexiv-damping-ratios",
+        type=float,
+        nargs="+",
+        default=[0.7],
+        help="One or more Flexiv joint impedance damping ratios in [0.3, 0.8]. Multiple values create a sweep.",
+    )
     args = parser.parse_args()
 
     if args.robot_name == "flexiv":
@@ -238,6 +273,12 @@ Examples:
             parser.error("--flexiv-robot-sn is required for Flexiv hardware collection unless --flexiv-dry-run is set")
         if args.flexiv_control_freq < 1 or args.flexiv_control_freq > 100:
             parser.error("--flexiv-control-freq must be in the RDK-supported 1-100 Hz range")
+        for stiffness_scale in args.flexiv_stiffness_scales:
+            if stiffness_scale < 0.0 or stiffness_scale > 1.0:
+                parser.error("--flexiv-stiffness-scales values must be in [0.0, 1.0]")
+        for damping_ratio in args.flexiv_damping_ratios:
+            if damping_ratio < 0.3 or damping_ratio > 0.8:
+                parser.error("--flexiv-damping-ratios values must be in the RDK-supported [0.3, 0.8] range")
 
     # Validate that at least one motion source is provided
     if not args.motion_files and not args.motion_folder:
@@ -272,7 +313,15 @@ Examples:
         print("Error: No motion files to run")
         exit(1)
 
-    total_runs = len(motion_files) * args.repeats
+    flexiv_impedance_settings = [(None, None)]
+    if args.robot_name == "flexiv" and args.flexiv_control_mode == "nrt_joint_impedance":
+        flexiv_impedance_settings = [
+            (stiffness_scale, damping_ratio)
+            for stiffness_scale in args.flexiv_stiffness_scales
+            for damping_ratio in args.flexiv_damping_ratios
+        ]
+
+    total_runs = len(motion_files) * args.repeats * len(flexiv_impedance_settings)
     current_run = 0
 
     for motion_filename in motion_files:
@@ -289,52 +338,69 @@ Examples:
             print(f"Warning: Motion file not found: {motion_file}")
             continue
 
-        for run_idx in range(1, args.repeats + 1):
-            current_run += 1
+        for stiffness_scale, damping_ratio in flexiv_impedance_settings:
+            for run_idx in range(1, args.repeats + 1):
+                current_run += 1
 
-            # Output directory: output/real/<robot>/<source>/
-            # (motion_name subdirectory created by collector's save function)
-            # For repeats > 1, append run suffix to motion name
-            output_dir = os.path.join(home_dir, args.output_folder, f"real/{args.robot_name}/{output_subfolder}")
-            os.makedirs(output_dir, exist_ok=True)
+                # Output directory: output/real/<robot>/<source>/
+                # (motion_name subdirectory created by collector's save function)
+                output_dir = os.path.join(home_dir, args.output_folder, f"real/{args.robot_name}/{output_subfolder}")
+                os.makedirs(output_dir, exist_ok=True)
 
-            # Modify motion name for repeated runs to avoid overwriting
-            effective_motion_name = motion_name if args.repeats == 1 else f"{motion_name}_run_{run_idx}"
+                suffixes = []
+                if args.repeats > 1:
+                    suffixes.append(f"run_{run_idx}")
+                if args.robot_name == "flexiv" and args.flexiv_control_mode == "nrt_joint_impedance":
+                    k_name = format_scalar_for_name(stiffness_scale)
+                    z_name = format_scalar_for_name(damping_ratio)
+                    suffixes.append(f"k{k_name}_z{z_name}")
 
-            print(f"\n{'='*60}")
-            print(f"Running motion: {effective_motion_name} (run {run_idx}/{args.repeats})")
-            print(f"Progress: {current_run}/{total_runs} total runs")
-            print(f"Output: {output_dir}/{effective_motion_name}/")
-            print(f"{'='*60}\n")
+                effective_motion_name = motion_name
+                if suffixes:
+                    effective_motion_name = f"{motion_name}_{'_'.join(suffixes)}"
 
-            run_motion(
-                args.robot_name,
-                motion_file,
-                output_dir,
-                motion_name=effective_motion_name,
-                auto_start=args.auto_start,
-                robot_port=args.robot_port,
-                robot_type=args.robot_type,
-                robot_id=args.robot_id,
-                flexiv_robot_sn=args.flexiv_robot_sn,
-                flexiv_joint_group=args.flexiv_joint_group,
-                flexiv_dry_run=args.flexiv_dry_run,
-                flexiv_control_freq=args.flexiv_control_freq,
-                flexiv_slowdown_factor=args.flexiv_slowdown_factor,
-                flexiv_max_velocity=args.flexiv_max_velocity,
-                flexiv_max_acceleration=args.flexiv_max_acceleration,
-                flexiv_home_plan=args.flexiv_home_plan,
-                flexiv_start_move_duration=args.flexiv_start_move_duration,
-                flexiv_start_max_velocity=args.flexiv_start_max_velocity,
-                flexiv_start_max_acceleration=args.flexiv_start_max_acceleration,
-                flexiv_motion_scale=args.flexiv_motion_scale,
-                flexiv_max_initial_diff_rad=args.flexiv_max_initial_diff_rad,
-            )
+                print(f"\n{'='*60}")
+                print(f"Running motion: {effective_motion_name} (run {run_idx}/{args.repeats})")
+                if args.robot_name == "flexiv":
+                    print(f"Flexiv mode: {args.flexiv_control_mode}")
+                    if args.flexiv_control_mode == "nrt_joint_impedance":
+                        print(f"Flexiv impedance: stiffness_scale={stiffness_scale:g}, damping_ratio={damping_ratio:g}")
+                print(f"Progress: {current_run}/{total_runs} total runs")
+                print(f"Output: {output_dir}/{effective_motion_name}/")
+                print(f"{'='*60}\n")
 
-            # Rest period between runs (skip after the last run)
-            if current_run < total_runs:
-                print(f"\n*** Resting for {REST_PERIOD_SECONDS} seconds to let robot cool off ***\n")
-                time.sleep(REST_PERIOD_SECONDS)
+                run_motion(
+                    args.robot_name,
+                    motion_file,
+                    output_dir,
+                    motion_name=effective_motion_name,
+                    auto_start=args.auto_start,
+                    robot_port=args.robot_port,
+                    robot_type=args.robot_type,
+                    robot_id=args.robot_id,
+                    flexiv_robot_sn=args.flexiv_robot_sn,
+                    flexiv_joint_group=args.flexiv_joint_group,
+                    flexiv_dry_run=args.flexiv_dry_run,
+                    flexiv_control_freq=args.flexiv_control_freq,
+                    flexiv_slowdown_factor=args.flexiv_slowdown_factor,
+                    flexiv_max_velocity=args.flexiv_max_velocity,
+                    flexiv_max_acceleration=args.flexiv_max_acceleration,
+                    flexiv_home_plan=args.flexiv_home_plan,
+                    flexiv_start_move_duration=args.flexiv_start_move_duration,
+                    flexiv_start_max_velocity=args.flexiv_start_max_velocity,
+                    flexiv_start_max_acceleration=args.flexiv_start_max_acceleration,
+                    flexiv_motion_scale=args.flexiv_motion_scale,
+                    flexiv_max_initial_diff_rad=args.flexiv_max_initial_diff_rad,
+                    flexiv_control_mode=args.flexiv_control_mode,
+                    flexiv_stiffness_scale=stiffness_scale if stiffness_scale is not None else 1.0,
+                    flexiv_damping_ratio=damping_ratio if damping_ratio is not None else 0.7,
+                )
+
+                # Rest period between runs (skip after the last run)
+                should_rest = current_run < total_runs and not (args.robot_name == "flexiv" and args.flexiv_dry_run)
+                if should_rest:
+                    print(f"\n*** Resting for {REST_PERIOD_SECONDS} seconds to let robot cool off ***\n")
+                    time.sleep(REST_PERIOD_SECONDS)
 
     print(f"\n{'='*60}")
     print(f"All motions completed! Total runs: {total_runs}")

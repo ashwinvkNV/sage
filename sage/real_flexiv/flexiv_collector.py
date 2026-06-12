@@ -8,12 +8,13 @@
 
 """Flexiv motion collector for SAGE-compatible real robot data.
 
-The hardware path uses Flexiv RDK non-real-time joint position control:
+The hardware path uses Flexiv RDK non-real-time joint impedance control by default:
 
     robot = flexivrdk.Robot(robot_sn)
     robot.ClearFault()
     robot.Enable()
-    robot.SwitchMode(flexivrdk.Mode.NRT_JOINT_POSITION)
+    robot.SwitchMode(flexivrdk.Mode.NRT_JOINT_IMPEDANCE)
+    robot.SetJointImpedance(group, K_q, Z_q)
     robot.SendJointPosition({group: flexivrdk.NrtJointPositionCmd(...)})
 
 Collected data is written as control.csv, state_motor.csv, event.csv, and
@@ -23,6 +24,7 @@ joint_list.txt for the SAGE / IsaacLab-Newton SysID flow.
 from __future__ import annotations
 
 import csv
+import json
 import os
 import time
 from pathlib import Path
@@ -49,6 +51,12 @@ DEFAULT_FLEXIV_JOINT_NAMES = [
     "joint6",
     "joint7",
 ]
+
+
+FLEXIV_CONTROL_MODES = {
+    "nrt_joint_impedance": "NRT_JOINT_IMPEDANCE",
+    "nrt_joint_position": "NRT_JOINT_POSITION",
+}
 
 
 def interpolate_motion(seq, original_freq, target_freq):
@@ -106,6 +114,9 @@ class FlexivCollector:
         max_velocity=0.05,
         max_acceleration=0.1,
         home_plan=None,
+        control_mode="nrt_joint_impedance",
+        stiffness_scale=1.0,
+        damping_ratio=0.7,
     ):
         self.robot_sn = robot_sn
         self.joint_names = list(joint_names)
@@ -114,14 +125,31 @@ class FlexivCollector:
         self.max_velocity = max_velocity
         self.max_acceleration = max_acceleration
         self.home_plan = home_plan
+        self.control_mode = control_mode
+        self.stiffness_scale = stiffness_scale
+        self.damping_ratio = damping_ratio
         self.robot = None
         self.group = None
         self.start_monotonic = None
         self.last_command = np.zeros(len(self.joint_names), dtype=np.float64)
         self.collected_data = self._empty_data()
+        self.nominal_stiffness = None
+        self.applied_stiffness = None
+        self.applied_damping_ratio = None
+
+        if self.control_mode not in FLEXIV_CONTROL_MODES:
+            valid = ", ".join(sorted(FLEXIV_CONTROL_MODES))
+            raise ValueError(f"Unsupported Flexiv control mode '{self.control_mode}'. Valid modes: {valid}")
+        if self.stiffness_scale < 0.0 or self.stiffness_scale > 1.0:
+            raise ValueError("--flexiv-stiffness-scale must be in [0.0, 1.0]")
+        if self.damping_ratio < 0.3 or self.damping_ratio > 0.8:
+            raise ValueError("--flexiv-damping-ratio must be in the RDK-supported [0.3, 0.8] range")
 
         if self.dry_run:
             print("[Flexiv Collector] Dry run enabled; no hardware commands will be sent.")
+            if self.control_mode == "nrt_joint_impedance":
+                self.applied_stiffness = [self.stiffness_scale] * len(self.joint_names)
+                self.applied_damping_ratio = [self.damping_ratio] * len(self.joint_names)
             return
 
         if not FLEXIV_AVAILABLE:
@@ -141,7 +169,7 @@ class FlexivCollector:
         }
 
     def _prepare_robot(self):
-        """Clear faults, enable, optionally home, and switch to NRT joint position."""
+        """Clear faults, enable, optionally home, and switch to the requested joint mode."""
         if self.robot.fault():
             print("[Flexiv Collector] Fault detected; attempting ClearFault()")
             if not self.robot.ClearFault():
@@ -162,8 +190,30 @@ class FlexivCollector:
             while self.robot.busy():
                 time.sleep(0.5)
 
-        self.robot.SwitchMode(flexivrdk.Mode.NRT_JOINT_POSITION)
+        rdk_mode = getattr(flexivrdk.Mode, FLEXIV_CONTROL_MODES[self.control_mode])
+        self.robot.SwitchMode(rdk_mode)
+        print(f"[Flexiv Collector] Switched to mode: {FLEXIV_CONTROL_MODES[self.control_mode]}")
+
+        if self.control_mode == "nrt_joint_impedance":
+            self._apply_joint_impedance()
+
         self.last_command, _, _ = self.read_state()
+
+    def _apply_joint_impedance(self):
+        """Apply scaled nominal joint stiffness and uniform damping ratio."""
+        nominal = np.array(self.robot.info().K_q_nom, dtype=np.float64)
+        stiffness = (self.stiffness_scale * nominal).tolist()
+        damping = [self.damping_ratio] * len(stiffness)
+        self.robot.SetJointImpedance(self.group, stiffness, damping)
+        self.nominal_stiffness = nominal.tolist()
+        self.applied_stiffness = stiffness
+        self.applied_damping_ratio = damping
+        print(
+            "[Flexiv Collector] Joint impedance set "
+            f"(stiffness_scale={self.stiffness_scale:g}, damping_ratio={self.damping_ratio:g})"
+        )
+        print(f"[Flexiv Collector] K_q: {stiffness}")
+        print(f"[Flexiv Collector] Z_q: {damping}")
 
     def read_state(self):
         """Return link-side positions, link-side velocities, and measured torques."""
@@ -331,7 +381,15 @@ class FlexivCollector:
             print(f"[Flexiv Collector] Warning: robot.Stop() failed: {exc}")
 
 
-def save_sage_format(output_dir, motion_name, joint_names, command_times, command_positions, collected_data):
+def save_sage_format(
+    output_dir,
+    motion_name,
+    joint_names,
+    command_times,
+    command_positions,
+    collected_data,
+    metadata=None,
+):
     """Save collected Flexiv data in SAGE-compatible real robot format."""
     motion_dir = os.path.join(output_dir, motion_name)
     os.makedirs(motion_dir, exist_ok=True)
@@ -372,6 +430,11 @@ def save_sage_format(output_dir, motion_name, joint_names, command_times, comman
                 ]
             )
 
+    if metadata:
+        metadata_file = os.path.join(motion_dir, "metadata.json")
+        with open(metadata_file, "w") as f:
+            json.dump(metadata, f, indent=2, sort_keys=True)
+
     print(f"[Flexiv Collector] Data saved to: {motion_dir}")
 
 
@@ -393,6 +456,9 @@ def flexiv_collector_main(
     start_max_acceleration=0.05,
     motion_scale=1.0,
     max_initial_diff_rad=0.5,
+    control_mode="nrt_joint_impedance",
+    stiffness_scale=1.0,
+    damping_ratio=0.7,
 ):
     """Run a motion on Flexiv and collect SAGE-format data."""
     print(f"[Flexiv Collector] Loading motion: {motion_file}")
@@ -418,6 +484,9 @@ def flexiv_collector_main(
         max_velocity=max_velocity,
         max_acceleration=max_acceleration,
         home_plan=home_plan,
+        control_mode=control_mode,
+        stiffness_scale=stiffness_scale,
+        damping_ratio=damping_ratio,
     )
 
     try:
@@ -438,6 +507,20 @@ def flexiv_collector_main(
             command_times=command_times,
             command_positions=command_positions,
             collected_data=collector.collected_data,
+            metadata={
+                "robot": "flexiv",
+                "control_mode": control_mode,
+                "stiffness_scale": stiffness_scale,
+                "damping_ratio": damping_ratio,
+                "nominal_stiffness": collector.nominal_stiffness,
+                "applied_stiffness": collector.applied_stiffness,
+                "applied_damping_ratio": collector.applied_damping_ratio,
+                "max_velocity": max_velocity,
+                "max_acceleration": max_acceleration,
+                "motion_scale": motion_scale,
+                "control_freq": control_freq,
+                "slowdown_factor": slowdown_factor,
+            },
         )
         print("[Flexiv Collector] Collection complete")
     finally:
