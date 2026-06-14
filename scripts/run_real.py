@@ -17,6 +17,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REST_PERIOD_SECONDS = 15
 
 
+def parse_motion_limit(value):
+    if isinstance(value, str) and value.lower() in ("inf", "infinity"):
+        return float("inf")
+    return float(value)
+
+
 def format_scalar_for_name(value):
     """Format a scalar for filesystem-safe Flexiv sweep suffixes."""
     return f"{value:g}".replace("-", "m").replace(".", "p")
@@ -44,6 +50,7 @@ def run_motion(
     flexiv_start_max_acceleration=0.05,
     flexiv_motion_scale=1.0,
     flexiv_max_initial_diff_rad=0.5,
+    flexiv_center_on_current_pose=False,
     flexiv_control_mode="nrt_joint_impedance",
     flexiv_stiffness_scale=1.0,
     flexiv_damping_ratio=0.7,
@@ -90,6 +97,7 @@ def run_motion(
             start_max_acceleration=flexiv_start_max_acceleration,
             motion_scale=flexiv_motion_scale,
             max_initial_diff_rad=flexiv_max_initial_diff_rad,
+            center_on_current_pose=flexiv_center_on_current_pose,
             control_mode=flexiv_control_mode,
             stiffness_scale=flexiv_stiffness_scale,
             damping_ratio=flexiv_damping_ratio,
@@ -196,15 +204,15 @@ Examples:
     )
     parser.add_argument(
         "--flexiv-max-velocity",
-        type=float,
+        type=parse_motion_limit,
         default=0.05,
-        help="Flexiv NrtJointPositionCmd dq_max per joint in rad/s.",
+        help="Flexiv SendJointPosition dq_max per joint in rad/s. Use 'inf' for robot dq_max.",
     )
     parser.add_argument(
         "--flexiv-max-acceleration",
-        type=float,
+        type=parse_motion_limit,
         default=0.1,
-        help="Flexiv NrtJointPositionCmd ddq_max per joint in rad/s^2.",
+        help="Flexiv SendJointPosition ddq_max per joint in rad/s^2. Use 'inf' for aggressive limits.",
     )
     parser.add_argument(
         "--flexiv-home-plan",
@@ -241,6 +249,11 @@ Examples:
         type=float,
         default=0.5,
         help="Prompt if any Flexiv joint must move farther than this to reach the first waypoint.",
+    )
+    parser.add_argument(
+        "--flexiv-center-on-current-pose",
+        action="store_true",
+        help="Shift the motion so the first waypoint matches the robot's current pose.",
     )
     parser.add_argument(
         "--flexiv-control-mode",
@@ -391,6 +404,7 @@ Examples:
                     flexiv_start_max_acceleration=args.flexiv_start_max_acceleration,
                     flexiv_motion_scale=args.flexiv_motion_scale,
                     flexiv_max_initial_diff_rad=args.flexiv_max_initial_diff_rad,
+                    flexiv_center_on_current_pose=args.flexiv_center_on_current_pose,
                     flexiv_control_mode=args.flexiv_control_mode,
                     flexiv_stiffness_scale=stiffness_scale if stiffness_scale is not None else 1.0,
                     flexiv_damping_ratio=damping_ratio if damping_ratio is not None else 0.7,

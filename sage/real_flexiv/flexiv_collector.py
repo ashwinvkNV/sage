@@ -14,8 +14,8 @@ The hardware path uses Flexiv RDK non-real-time joint impedance control by defau
     robot.ClearFault()
     robot.Enable()
     robot.SwitchMode(flexivrdk.Mode.NRT_JOINT_IMPEDANCE)
-    robot.SetJointImpedance(group, K_q, Z_q)
-    robot.SendJointPosition({group: flexivrdk.NrtJointPositionCmd(...)})
+    robot.SetJointImpedance(K_q, Z_q)
+    robot.SendJointPosition(q_d, dq_d, dq_max, ddq_max)
 
 Collected data is written as control.csv, state_motor.csv, event.csv, and
 joint_list.txt for the SAGE / IsaacLab-Newton SysID flow.
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -58,6 +59,9 @@ FLEXIV_CONTROL_MODES = {
     "nrt_joint_position": "NRT_JOINT_POSITION",
 }
 
+FLEXIV_UNLIMITED_MOTION = float("inf")
+DEFAULT_UNLIMITED_ACCEL_SCALE = 100.0
+
 
 def interpolate_motion(seq, original_freq, target_freq):
     """Interpolate a joint trajectory to the target control frequency."""
@@ -83,23 +87,40 @@ def load_motion_from_txt(txt_file_path):
     return seq, joint_names, motion_freq, motion_name
 
 
-def _select_group(robot, requested_group_name):
-    """Select a Flexiv joint group by name, or the first available group."""
-    groups = list(robot.groups())
-    if not groups:
-        raise RuntimeError("Flexiv robot reported no joint groups")
+def _resolve_joint_group(robot, requested_group_name):
+    """Resolve a Flexiv joint group handle, or None for single-group RDK APIs."""
+    if hasattr(robot, "groups") and hasattr(flexivrdk, "kJointGroupNames"):
+        groups = list(robot.groups())
+        if not groups:
+            raise RuntimeError("Flexiv robot reported no joint groups")
 
-    if requested_group_name is None:
-        return groups[0]
+        if requested_group_name is None:
+            return groups[0]
 
-    requested_group_name = requested_group_name.upper()
-    for group in groups:
-        group_name = flexivrdk.kJointGroupNames[group]
-        if group_name.upper() == requested_group_name:
-            return group
+        requested_group_name = requested_group_name.upper()
+        for group in groups:
+            group_name = flexivrdk.kJointGroupNames[group]
+            if group_name.upper() == requested_group_name:
+                return group
 
-    available = [flexivrdk.kJointGroupNames[group] for group in groups]
-    raise RuntimeError(f"Flexiv joint group '{requested_group_name}' not found. Available groups: {available}")
+        available = [flexivrdk.kJointGroupNames[group] for group in groups]
+        raise RuntimeError(
+            f"Flexiv joint group '{requested_group_name}' not found. Available groups: {available}"
+        )
+
+    if requested_group_name is not None:
+        requested = requested_group_name.upper()
+        if requested not in {"ARMS", "ARM"}:
+            print(
+                "[Flexiv Collector] Warning: "
+                f"joint group '{requested_group_name}' is not supported by this RDK version; "
+                "controlling all robot joints"
+            )
+    return None
+
+
+def is_unlimited_motion_limit(value):
+    return value is None or math.isinf(value)
 
 
 class FlexivCollector:
@@ -136,6 +157,7 @@ class FlexivCollector:
         self.nominal_stiffness = None
         self.applied_stiffness = None
         self.applied_damping_ratio = None
+        self.robot_dq_max = None
 
         if self.control_mode not in FLEXIV_CONTROL_MODES:
             valid = ", ".join(sorted(FLEXIV_CONTROL_MODES))
@@ -180,8 +202,11 @@ class FlexivCollector:
         while not self.robot.operational():
             time.sleep(1.0)
 
-        self.group = _select_group(self.robot, self.joint_group_name)
-        print(f"[Flexiv Collector] Using joint group: {flexivrdk.kJointGroupNames[self.group]}")
+        self.group = _resolve_joint_group(self.robot, self.joint_group_name)
+        if self.group is not None:
+            print(f"[Flexiv Collector] Using joint group: {flexivrdk.kJointGroupNames[self.group]}")
+        else:
+            print(f"[Flexiv Collector] Using all {self.robot.info().DoF} robot joints")
 
         if self.home_plan:
             print(f"[Flexiv Collector] Executing home plan: {self.home_plan}")
@@ -197,14 +222,46 @@ class FlexivCollector:
         if self.control_mode == "nrt_joint_impedance":
             self._apply_joint_impedance()
 
+        self.robot_dq_max = np.array(self.robot.info().dq_max, dtype=np.float64)
+        if is_unlimited_motion_limit(self.max_velocity) or is_unlimited_motion_limit(self.max_acceleration):
+            max_vel, max_acc = self._resolve_command_limits(self.max_velocity, self.max_acceleration, len(self.joint_names))
+            print("[Flexiv Collector] Using robot software motion limits:")
+            print(f"  dq_max (rad/s): {max_vel}")
+            print(f"  ddq_max (rad/s^2): {max_acc}")
         self.last_command, _, _ = self.read_state()
+
+    def _resolve_command_limits(self, max_velocity, max_acceleration, n_joints):
+        """Map unlimited limits to per-joint robot software maximums."""
+        if self.robot_dq_max is not None and len(self.robot_dq_max) >= n_joints:
+            robot_dq_max = self.robot_dq_max[:n_joints]
+        else:
+            robot_dq_max = np.full(n_joints, 2.0, dtype=np.float64)
+
+        if is_unlimited_motion_limit(max_velocity):
+            max_vel = robot_dq_max.tolist()
+        elif np.isscalar(max_velocity):
+            max_vel = [float(max_velocity)] * n_joints
+        else:
+            max_vel = list(max_velocity)
+
+        if is_unlimited_motion_limit(max_acceleration):
+            max_acc = (robot_dq_max * DEFAULT_UNLIMITED_ACCEL_SCALE).tolist()
+        elif np.isscalar(max_acceleration):
+            max_acc = [float(max_acceleration)] * n_joints
+        else:
+            max_acc = list(max_acceleration)
+
+        return max_vel, max_acc
 
     def _apply_joint_impedance(self):
         """Apply scaled nominal joint stiffness and uniform damping ratio."""
         nominal = np.array(self.robot.info().K_q_nom, dtype=np.float64)
         stiffness = (self.stiffness_scale * nominal).tolist()
         damping = [self.damping_ratio] * len(stiffness)
-        self.robot.SetJointImpedance(self.group, stiffness, damping)
+        if self.group is not None:
+            self.robot.SetJointImpedance(self.group, stiffness, damping)
+        else:
+            self.robot.SetJointImpedance(stiffness, damping)
         self.nominal_stiffness = nominal.tolist()
         self.applied_stiffness = stiffness
         self.applied_damping_ratio = damping
@@ -224,7 +281,7 @@ class FlexivCollector:
                 np.zeros(len(self.joint_names), dtype=np.float64),
             )
 
-        states = self.robot.states()[self.group]
+        states = self.robot.states()[self.group] if self.group is not None else self.robot.states()
         positions = np.array(states.q, dtype=np.float64)
         velocities = np.array(states.dq, dtype=np.float64)
         torques = np.array(states.tau, dtype=np.float64)
@@ -241,10 +298,12 @@ class FlexivCollector:
         zero_vel = [0.0] * len(positions)
         max_velocity = self.max_velocity if max_velocity is None else max_velocity
         max_acceleration = self.max_acceleration if max_acceleration is None else max_acceleration
-        max_vel = [max_velocity] * len(positions)
-        max_acc = [max_acceleration] * len(positions)
-        cmd = flexivrdk.NrtJointPositionCmd(positions.tolist(), zero_vel, max_vel, max_acc)
-        self.robot.SendJointPosition({self.group: cmd})
+        max_vel, max_acc = self._resolve_command_limits(max_velocity, max_acceleration, len(positions))
+        if self.group is not None:
+            cmd = flexivrdk.NrtJointPositionCmd(positions.tolist(), zero_vel, max_vel, max_acc)
+            self.robot.SendJointPosition({self.group: cmd})
+        else:
+            self.robot.SendJointPosition(positions.tolist(), zero_vel, max_vel, max_acc)
 
     def move_to_position(
         self,
@@ -303,10 +362,19 @@ class FlexivCollector:
         start_max_velocity=0.03,
         start_max_acceleration=0.05,
         max_initial_diff_rad=0.5,
+        center_on_current_pose=False,
     ):
         """Execute the motion sequence and collect SAGE-compatible data."""
         if motion_seq.shape[1] != len(self.joint_names):
             raise ValueError(f"Motion has {motion_seq.shape[1]} joints but collector expects {len(self.joint_names)}")
+
+        motion_seq = np.array(motion_seq, dtype=np.float64, copy=True)
+        if center_on_current_pose:
+            current_pos, _, _ = self.read_state()
+            offset = current_pos - motion_seq[0]
+            motion_seq = motion_seq + offset
+            print("[Flexiv Collector] Centered motion on current pose")
+            print(f"  Base offset (rad): {offset.tolist()}")
 
         if not self.safety_check(motion_seq[0], max_initial_diff_rad):
             print("[Flexiv Collector] Motion cancelled by user.")
@@ -318,18 +386,23 @@ class FlexivCollector:
         command_positions = []
         self.collected_data = self._empty_data()
 
-        print(
-            "[Flexiv Collector] Moving to start position "
-            f"(duration={start_move_duration}s, vmax={start_max_velocity}rad/s, amax={start_max_acceleration}rad/s^2)"
-        )
-        self.move_to_position(
-            motion_seq[0],
-            duration=start_move_duration,
-            control_freq=control_freq,
-            max_velocity=start_max_velocity,
-            max_acceleration=start_max_acceleration,
-        )
-        time.sleep(0.5)
+        current_pos, _, _ = self.read_state()
+        start_diff = float(np.max(np.abs(motion_seq[0] - current_pos)))
+        if start_diff > 1e-4:
+            print(
+                "[Flexiv Collector] Moving to start position "
+                f"(duration={start_move_duration}s, vmax={start_max_velocity}rad/s, amax={start_max_acceleration}rad/s^2)"
+            )
+            self.move_to_position(
+                motion_seq[0],
+                duration=start_move_duration,
+                control_freq=control_freq,
+                max_velocity=start_max_velocity,
+                max_acceleration=start_max_acceleration,
+            )
+            time.sleep(0.5)
+        else:
+            print("[Flexiv Collector] Already at start position, skipping initial move")
 
         print("\n=== READY TO START FLEXIV MOTION ===")
         print(f"Motion: {n_frames} frames at {control_freq}Hz (slowdown: {slowdown_factor}x)")
@@ -456,6 +529,7 @@ def flexiv_collector_main(
     start_max_acceleration=0.05,
     motion_scale=1.0,
     max_initial_diff_rad=0.5,
+    center_on_current_pose=False,
     control_mode="nrt_joint_impedance",
     stiffness_scale=1.0,
     damping_ratio=0.7,
@@ -499,6 +573,7 @@ def flexiv_collector_main(
             start_max_velocity=start_max_velocity,
             start_max_acceleration=start_max_acceleration,
             max_initial_diff_rad=max_initial_diff_rad,
+            center_on_current_pose=center_on_current_pose,
         )
         save_sage_format(
             output_dir=output_dir,
@@ -518,6 +593,7 @@ def flexiv_collector_main(
                 "max_velocity": max_velocity,
                 "max_acceleration": max_acceleration,
                 "motion_scale": motion_scale,
+                "center_on_current_pose": center_on_current_pose,
                 "control_freq": control_freq,
                 "slowdown_factor": slowdown_factor,
             },
