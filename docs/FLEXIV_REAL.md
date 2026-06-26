@@ -167,3 +167,94 @@ joint damping ratio passed to `SetJointImpedance()`. Each run also writes a
   before multi-joint excitation.
 - The RDK non-real-time example documents command frequencies from 1 to 100 Hz;
   the script enforces that range.
+
+## Direct RT Joint Torque SysID
+
+Flexiv's Python RDK package may not expose `RT_JOINT_TORQUE`, but the C++ RDK
+does. Use this path only for conservative dynamics-identification tests. It
+streams direct joint torque commands at 1 kHz, ramps one joint at a time, stops
+when a small offset is reached, then resets before the next sign/joint trial.
+
+Build and print the command without touching hardware:
+
+```bash
+cd /home/agx_thor/workspaces/ashwinvk/sage
+source .venv/bin/activate
+
+python scripts/run_flexiv_torque_sysid.py \
+  --robot-sn Rizon4s-123456 \
+  --name rt_torque_joint1_smoke \
+  --joints joint1 \
+  --max-torque-nm 0.2 \
+  --offset-limit-deg 5 \
+  --passive-offset-limit-deg 2 \
+  --velocity-limit-rad-s 0.15 \
+  --trial-timeout-s 4 \
+  --ramp-duration-s 2 \
+  --dry-run
+```
+
+First hardware smoke test:
+
+```bash
+cd /home/agx_thor/workspaces/ashwinvk/sage
+source .venv/bin/activate
+
+python scripts/run_flexiv_torque_sysid.py \
+  --robot-sn Rizon4s-123456 \
+  --joint-group ARMS \
+  --home-plan PLAN-Home \
+  --name rt_torque_joint1_smoke \
+  --joints joint1 \
+  --max-torque-nm 0.2 \
+  --offset-limit-deg 5 \
+  --passive-offset-limit-deg 2 \
+  --velocity-limit-rad-s 0.15 \
+  --trial-timeout-s 4 \
+  --ramp-duration-s 2
+```
+
+Only after that is stable, run all joints at the intended 10 degree stop:
+
+```bash
+python scripts/run_flexiv_torque_sysid.py \
+  --robot-sn Rizon4s-123456 \
+  --joint-group ARMS \
+  --home-plan PLAN-Home \
+  --name rt_torque_all_joints_pm10deg \
+  --joints all \
+  --max-torque-nm 0.3 \
+  --offset-limit-deg 10 \
+  --passive-offset-limit-deg 3 \
+  --velocity-limit-rad-s 0.25 \
+  --trial-timeout-s 8 \
+  --ramp-duration-s 2
+```
+
+If Flexiv RDK C++ is installed in a non-system prefix, add:
+
+```bash
+--rdk-prefix /path/to/rdk_install
+```
+
+The resulting dataset is saved under:
+
+```text
+output/real/flexiv/torque_sysid/<name>/
+```
+
+Files written:
+
+- `control_torque.csv`: commanded torque vector per RT sample.
+- `state_motor.csv`: SAGE-style measured `positions`, `velocities`,
+  `torques`.
+- `state_motor_extended.csv`: measured `tau_des`, `tau_ext`, motor-side
+  `theta`/`dtheta`, and commanded torque.
+- `event.csv`: trial start/end markers.
+- `trial_summary.csv`: stop reason and max offsets per trial.
+- `metadata.json`: torque limits, home pose, reset policy, and timestamp
+  policy.
+
+The C++ collector keeps Flexiv gravity compensation and soft limits enabled by
+default in `RtJointTorqueCmd`. Do not pass `--disable-soft-limits` unless you
+have a specific safety-reviewed reason.
