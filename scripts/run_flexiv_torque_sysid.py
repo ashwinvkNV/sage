@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--name", default="rt_joint_torque_sysid", help="Dataset folder name")
     parser.add_argument("--joint-group", default=None, help="Flexiv joint group, e.g. ARMS")
     parser.add_argument("--home-plan", default="PLAN-Home", help="Plan used before each torque trial")
+    parser.add_argument("--home-zero", action="store_true", help="Move slowly to all-zero joints and use exact zero as home_q")
     parser.add_argument("--no-home-plan", action="store_true", help="Reset with slow NRT joint position instead")
     parser.add_argument("--joints", default="all", help="all, or comma list like joint1,joint2 or 1,2")
     parser.add_argument("--max-torque-nm", type=float, default=0.5, help="Peak torque on the active joint")
@@ -45,6 +46,8 @@ def main() -> None:
     parser.add_argument("--settle-s", type=float, default=1.0, help="Settle time after each reset")
     parser.add_argument("--reset-dq-max", type=float, default=0.05, help="NRT reset max velocity without home plan")
     parser.add_argument("--reset-ddq-max", type=float, default=0.10, help="NRT reset max acceleration without home plan")
+    parser.add_argument("--reset-timeout-s", type=float, default=45.0, help="NRT reset timeout")
+    parser.add_argument("--reset-tolerance-deg", type=float, default=5.0, help="Allowed reset error before torque trial")
     parser.add_argument("--rdk-prefix", default=None, help="CMAKE_PREFIX_PATH for a source-built Flexiv RDK install")
     parser.add_argument("--build-dir", default=None, help="CMake build directory")
     parser.add_argument("--no-build", action="store_true", help="Skip CMake configure/build")
@@ -99,9 +102,15 @@ def main() -> None:
         str(args.reset_dq_max),
         "--reset-ddq-max",
         str(args.reset_ddq_max),
+        "--reset-timeout-s",
+        str(args.reset_timeout_s),
+        "--reset-tolerance-deg",
+        str(args.reset_tolerance_deg),
     ]
     if args.joint_group:
         collect_cmd += ["--joint-group", args.joint_group]
+    if args.home_zero:
+        collect_cmd.append("--home-zero")
     if args.no_home_plan:
         collect_cmd.append("--no-home-plan")
     if args.auto_start:

@@ -13,3 +13,6 @@ set_target_properties(flexiv_rt_torque_sysid PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED ON)
 
+
+add_executable(flexiv_zero_torque_drift flexiv_zero_torque_drift.cpp)
+target_link_libraries(flexiv_zero_torque_drift flexiv::flexiv_rdk)
