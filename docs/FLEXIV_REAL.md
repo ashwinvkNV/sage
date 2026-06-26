@@ -70,10 +70,13 @@ This writes:
 
 ```text
 output/real/flexiv/custom/tiny_joint_sine/
+├── command_response.csv
+├── command_response_long.csv
 ├── control.csv
 ├── event.csv
 ├── joint_list.txt
-└── state_motor.csv
+├── state_motor.csv
+└── timing.csv
 ```
 
 ## Hardware Run
@@ -168,6 +171,187 @@ joint damping ratio passed to `SetJointImpedance()`. Each run also writes a
 - The RDK non-real-time example documents command frequencies from 1 to 100 Hz;
   the script enforces that range.
 
+## Large Impedance Command-Response Dataset
+
+For the hybrid GRU / command-response path, collect data through the same
+Flexiv impedance interface used during deployment. The generator below creates
+motion files with per-joint steps, per-joint chirps, all-joint multisines, and
+randomized hold commands. The collector logs commanded joint targets in
+`control.csv`, measured positions/velocities/torques in `state_motor.csv`,
+aligned tracking error in `command_response.csv` and
+`command_response_long.csv`, and the applied `stiffness_scale` /
+`damping_ratio` in `metadata.json`.
+
+Generate a tiny smoke dataset without touching hardware:
+
+```bash
+cd /home/agx_thor/workspaces/ashwinvk/sage
+source .venv/bin/activate
+
+python scripts/run_flexiv_impedance_dataset.py \
+  --dataset-name flexiv_impedance_smoke \
+  --profile smoke \
+  --prepare-only \
+  --overwrite
+```
+
+Run that smoke dataset on the robot:
+
+```bash
+python scripts/move_flexiv_to_home.py \
+  --robot-sn Rizon4s-123456 \
+  --joint-group ARMS \
+  --max-velocity 0.02 \
+  --max-acceleration 0.04 \
+  --timeout-s 240 \
+  --tolerance-deg 0.5
+
+python scripts/run_flexiv_impedance_dataset.py \
+  --dataset-name flexiv_impedance_smoke \
+  --profile smoke \
+  --robot-sn Rizon4s-123456 \
+  --joint-group ARMS \
+  --stiffness-scales 0.75 \
+  --damping-ratios 0.7 \
+  --overwrite
+```
+
+Prepare the larger dataset:
+
+```bash
+python scripts/run_flexiv_impedance_dataset.py \
+  --dataset-name flexiv_impedance_hybrid_v1 \
+  --profile large \
+  --prepare-only \
+  --overwrite
+```
+
+Collect the larger dataset for the primary deployment setting:
+
+```bash
+python scripts/run_flexiv_impedance_dataset.py \
+  --dataset-name flexiv_impedance_hybrid_v1 \
+  --profile large \
+  --robot-sn Rizon4s-123456 \
+  --joint-group ARMS \
+  --home-zero-first \
+  --stiffness-scales 0.75 \
+  --damping-ratios 0.7
+```
+
+If you want the learned model to condition on different Flexiv impedance
+settings, expand the controller sweep:
+
+```bash
+python scripts/run_flexiv_impedance_dataset.py \
+  --dataset-name flexiv_impedance_hybrid_sweep_v1 \
+  --profile large \
+  --robot-sn Rizon4s-123456 \
+  --joint-group ARMS \
+  --home-zero-first \
+  --stiffness-scales 0.5 0.75 1.0 \
+  --damping-ratios 0.5 0.7
+```
+
+The generated motions live under:
+
+```text
+motion_files/flexiv/impedance_hybrid/<dataset-name>/
+```
+
+The collected real data is saved under:
+
+```text
+output/real/flexiv/impedance_hybrid/<dataset-name>/<motion>_k<scale>_z<ratio>/
+```
+
+By default, generated motions are zero-based and `run_real.py` moves slowly to
+the first waypoint before each motion. On a Rizon4s where all-zero joint
+position is the selected lab home pose, run `--home-zero-first` or
+`scripts/move_flexiv_to_home.py` first. If you want to collect around the
+current robot pose instead, add `--center-on-current-pose`.
+
+### Tracking Error Files
+
+`command_response.csv` is a vector-format derived file. For each feedback
+sample, it picks the latest command whose send timestamp is at or before the
+state-read timestamp and writes:
+
+```text
+feedback_timestamp
+command_timestamp
+command_age_s
+command_positions
+measured_positions
+measured_velocities
+measured_torques
+position_error
+```
+
+where:
+
+```text
+position_error = command_positions - measured_positions
+```
+
+`command_response_long.csv` stores the same aligned data one joint per row,
+which is usually easier for GRU training/debugging.
+
+## Home / Reset Workflow Notes
+
+Flexiv's public RDK examples commonly call:
+
+```cpp
+robot.SwitchMode(flexiv::rdk::Mode::NRT_PLAN_EXECUTION);
+robot.ExecutePlan("PLAN-Home");
+```
+
+but `PLAN-Home` must exist on the robot controller. If that saved plan is not
+present in Flexiv Elements, use a slow joint-space reset instead:
+
+```bash
+python scripts/move_flexiv_to_home.py \
+  --robot-sn Rizon4s-123456 \
+  --joint-group ARMS \
+  --target-q 0,0,0,0,0,0,0 \
+  --max-velocity 0.02 \
+  --max-acceleration 0.04 \
+  --timeout-s 240 \
+  --tolerance-deg 0.5
+```
+
+The torque SysID collector also supports this directly:
+
+```bash
+python scripts/run_flexiv_torque_sysid.py \
+  --robot-sn Rizon4s-123456 \
+  --joint-group ARMS \
+  --home-zero \
+  --reset-dq-max 0.02 \
+  --reset-ddq-max 0.04 \
+  --reset-timeout-s 240 \
+  --reset-tolerance-deg 0.5 \
+  --name rt_torque_joint1_smoke \
+  --joints joint1 \
+  --max-torque-nm 0.2 \
+  --offset-limit-deg 5 \
+  --passive-offset-limit-deg 2 \
+  --velocity-limit-rad-s 0.15 \
+  --trial-timeout-s 4 \
+  --ramp-duration-s 2
+```
+
+For RDK v1.8 we wait on measured joint-position error rather than relying only
+on `robot.stopped()` after `SendJointPosition()`. This is the safer criterion
+for torque SysID because it verifies the robot is actually within the desired
+joint-space tolerance before switching into `RT_JOINT_TORQUE`.
+
+Public RDK headers document `Robot::SetVelocityScale()` for plan and primitive
+execution, but not for `SendJointPosition()` trajectories. If you use
+`ExecutePlan()`, you can try `SetVelocityScale()` in
+`NRT_PLAN_EXECUTION`; otherwise use explicit `dq_max`/`ddq_max` with
+`NRT_JOINT_POSITION`.
+
 ## Direct RT Joint Torque SysID
 
 Flexiv's Python RDK package may not expose `RT_JOINT_TORQUE`, but the C++ RDK
@@ -184,6 +368,7 @@ source .venv/bin/activate
 python scripts/run_flexiv_torque_sysid.py \
   --robot-sn Rizon4s-123456 \
   --name rt_torque_joint1_smoke \
+  --home-zero \
   --joints joint1 \
   --max-torque-nm 0.2 \
   --offset-limit-deg 5 \
@@ -203,7 +388,11 @@ source .venv/bin/activate
 python scripts/run_flexiv_torque_sysid.py \
   --robot-sn Rizon4s-123456 \
   --joint-group ARMS \
-  --home-plan PLAN-Home \
+  --home-zero \
+  --reset-dq-max 0.02 \
+  --reset-ddq-max 0.04 \
+  --reset-timeout-s 240 \
+  --reset-tolerance-deg 0.5 \
   --name rt_torque_joint1_smoke \
   --joints joint1 \
   --max-torque-nm 0.2 \
@@ -220,7 +409,11 @@ Only after that is stable, run all joints at the intended 10 degree stop:
 python scripts/run_flexiv_torque_sysid.py \
   --robot-sn Rizon4s-123456 \
   --joint-group ARMS \
-  --home-plan PLAN-Home \
+  --home-zero \
+  --reset-dq-max 0.02 \
+  --reset-ddq-max 0.04 \
+  --reset-timeout-s 240 \
+  --reset-tolerance-deg 0.5 \
   --name rt_torque_all_joints_pm10deg \
   --joints all \
   --max-torque-nm 0.3 \

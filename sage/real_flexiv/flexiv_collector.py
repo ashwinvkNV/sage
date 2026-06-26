@@ -17,8 +17,8 @@ The hardware path uses Flexiv RDK non-real-time joint impedance control by defau
     robot.SetJointImpedance(K_q, Z_q)
     robot.SendJointPosition(q_d, dq_d, dq_max, ddq_max)
 
-Collected data is written as control.csv, state_motor.csv, event.csv, and
-joint_list.txt for the SAGE / IsaacLab-Newton SysID flow.
+Collected data is written as control.csv, state_motor.csv, event.csv,
+timing.csv, and joint_list.txt for the SAGE / IsaacLab-Newton SysID flow.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import json
 import math
 import os
 import time
+from bisect import bisect_right
 from pathlib import Path
 
 import numpy as np
@@ -154,6 +155,7 @@ class FlexivCollector:
         self.start_monotonic = None
         self.last_command = np.zeros(len(self.joint_names), dtype=np.float64)
         self.collected_data = self._empty_data()
+        self.timing_data = self._empty_timing_data()
         self.nominal_stiffness = None
         self.applied_stiffness = None
         self.applied_damping_ratio = None
@@ -188,6 +190,17 @@ class FlexivCollector:
             "positions": [],
             "velocities": [],
             "torques": [],
+        }
+
+    def _empty_timing_data(self):
+        return {
+            "frame": [],
+            "loop_start_s": [],
+            "command_send_start_s": [],
+            "command_send_end_s": [],
+            "state_read_start_s": [],
+            "state_read_end_s": [],
+            "loop_work_s": [],
         }
 
     def _prepare_robot(self):
@@ -385,6 +398,7 @@ class FlexivCollector:
         command_times = []
         command_positions = []
         self.collected_data = self._empty_data()
+        self.timing_data = self._empty_timing_data()
 
         current_pos, _, _ = self.read_state()
         start_diff = float(np.max(np.abs(motion_seq[0] - current_pos)))
@@ -417,23 +431,34 @@ class FlexivCollector:
 
         for i in range(n_frames):
             loop_start = time.monotonic()
-            t = loop_start - self.start_monotonic
+            loop_start_s = loop_start - self.start_monotonic
 
             if not self.dry_run and self.robot.fault():
                 raise RuntimeError("Fault occurred on the connected Flexiv robot")
 
             target_pos = motion_seq[i]
+            command_send_start_s = time.monotonic() - self.start_monotonic
             self.write_positions(target_pos)
-            command_times.append(t)
+            command_send_end_s = time.monotonic() - self.start_monotonic
+            command_times.append(command_send_start_s)
             command_positions.append(target_pos.copy())
 
+            state_read_start_s = time.monotonic() - self.start_monotonic
             positions, velocities, torques = self.read_state()
-            self.collected_data["time"].append(t)
+            state_read_end_s = time.monotonic() - self.start_monotonic
+            self.collected_data["time"].append(state_read_end_s)
             self.collected_data["positions"].append(positions)
             self.collected_data["velocities"].append(velocities)
             self.collected_data["torques"].append(torques)
 
             loop_elapsed = time.monotonic() - loop_start
+            self.timing_data["frame"].append(i)
+            self.timing_data["loop_start_s"].append(loop_start_s)
+            self.timing_data["command_send_start_s"].append(command_send_start_s)
+            self.timing_data["command_send_end_s"].append(command_send_end_s)
+            self.timing_data["state_read_start_s"].append(state_read_start_s)
+            self.timing_data["state_read_end_s"].append(state_read_end_s)
+            self.timing_data["loop_work_s"].append(loop_elapsed)
             sleep_time = max(0.0, loop_dt - loop_elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)
@@ -461,6 +486,7 @@ def save_sage_format(
     command_times,
     command_positions,
     collected_data,
+    timing_data=None,
     metadata=None,
 ):
     """Save collected Flexiv data in SAGE-compatible real robot format."""
@@ -502,6 +528,115 @@ def save_sage_format(
                     collected_data["torques"][i].tolist(),
                 ]
             )
+
+    response_rows = []
+    command_times_list = list(command_times)
+    for i, state_time in enumerate(collected_data["time"]):
+        if not command_times_list:
+            break
+        command_idx = max(0, bisect_right(command_times_list, state_time) - 1)
+        command_time = command_times_list[command_idx]
+        command_pos = np.array(command_positions[command_idx], dtype=np.float64)
+        measured_pos = np.array(collected_data["positions"][i], dtype=np.float64)
+        measured_vel = np.array(collected_data["velocities"][i], dtype=np.float64)
+        measured_torque = np.array(collected_data["torques"][i], dtype=np.float64)
+        position_error = command_pos - measured_pos
+        response_rows.append(
+            {
+                "feedback_time": state_time,
+                "command_time": command_time,
+                "command_age_s": state_time - command_time,
+                "command_positions": command_pos,
+                "measured_positions": measured_pos,
+                "measured_velocities": measured_vel,
+                "measured_torques": measured_torque,
+                "position_error": position_error,
+            }
+        )
+
+    response_file = os.path.join(motion_dir, "command_response.csv")
+    with open(response_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "type",
+                "feedback_timestamp",
+                "command_timestamp",
+                "command_age_s",
+                "command_positions",
+                "measured_positions",
+                "measured_velocities",
+                "measured_torques",
+                "position_error",
+            ]
+        )
+        for row in response_rows:
+            writer.writerow(
+                [
+                    "COMMAND_RESPONSE",
+                    row["feedback_time"] * 1e6,
+                    row["command_time"] * 1e6,
+                    row["command_age_s"],
+                    row["command_positions"].tolist(),
+                    row["measured_positions"].tolist(),
+                    row["measured_velocities"].tolist(),
+                    row["measured_torques"].tolist(),
+                    row["position_error"].tolist(),
+                ]
+            )
+
+    response_long_file = os.path.join(motion_dir, "command_response_long.csv")
+    with open(response_long_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "type",
+                "feedback_timestamp",
+                "command_timestamp",
+                "command_age_s",
+                "joint",
+                "joint_index",
+                "command_position",
+                "measured_position",
+                "measured_velocity",
+                "measured_torque",
+                "position_error",
+            ]
+        )
+        for row in response_rows:
+            for joint_idx, joint_name in enumerate(joint_names):
+                writer.writerow(
+                    [
+                        "COMMAND_RESPONSE_JOINT",
+                        row["feedback_time"] * 1e6,
+                        row["command_time"] * 1e6,
+                        row["command_age_s"],
+                        joint_name,
+                        joint_idx,
+                        row["command_positions"][joint_idx],
+                        row["measured_positions"][joint_idx],
+                        row["measured_velocities"][joint_idx],
+                        row["measured_torques"][joint_idx],
+                        row["position_error"][joint_idx],
+                    ]
+                )
+
+    if timing_data:
+        timing_file = os.path.join(motion_dir, "timing.csv")
+        timing_fields = [
+            "frame",
+            "loop_start_s",
+            "command_send_start_s",
+            "command_send_end_s",
+            "state_read_start_s",
+            "state_read_end_s",
+            "loop_work_s",
+        ]
+        with open(timing_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(timing_fields)
+            for i in range(len(timing_data["frame"])):
+                writer.writerow([timing_data[field][i] for field in timing_fields])
 
     if metadata:
         metadata_file = os.path.join(motion_dir, "metadata.json")
@@ -582,6 +717,7 @@ def flexiv_collector_main(
             command_times=command_times,
             command_positions=command_positions,
             collected_data=collector.collected_data,
+            timing_data=collector.timing_data,
             metadata={
                 "robot": "flexiv",
                 "control_mode": control_mode,
@@ -596,6 +732,14 @@ def flexiv_collector_main(
                 "center_on_current_pose": center_on_current_pose,
                 "control_freq": control_freq,
                 "slowdown_factor": slowdown_factor,
+                "timestamp_policy": {
+                    "control_csv_timestamp": "command_send_start_s",
+                    "state_motor_csv_timestamp": "state_read_end_s",
+                    "command_response_alignment": (
+                        "latest command_send_start_s at or before state_read_end_s"
+                    ),
+                    "timing_csv_units": "seconds_from_motion_start",
+                },
             },
         )
         print("[Flexiv Collector] Collection complete")

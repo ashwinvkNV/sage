@@ -28,7 +28,7 @@ def main() -> None:
     parser.add_argument("--output-folder", default="output", help="SAGE output root")
     parser.add_argument("--name", default="rt_joint_torque_sysid", help="Dataset folder name")
     parser.add_argument("--joint-group", default=None, help="Flexiv joint group, e.g. ARMS")
-    parser.add_argument("--home-plan", default="PLAN-Home", help="Plan used before each torque trial")
+    parser.add_argument("--home-plan", default="", help="Optional saved plan used before each torque trial")
     parser.add_argument("--home-zero", action="store_true", help="Move slowly to all-zero joints and use exact zero as home_q")
     parser.add_argument("--no-home-plan", action="store_true", help="Reset with slow NRT joint position instead")
     parser.add_argument("--joints", default="all", help="all, or comma list like joint1,joint2 or 1,2")
@@ -44,10 +44,10 @@ def main() -> None:
     parser.add_argument("--trial-timeout-s", type=float, default=8.0, help="Max duration for each sign/joint trial")
     parser.add_argument("--ramp-duration-s", type=float, default=2.0, help="Half-cosine torque ramp duration")
     parser.add_argument("--settle-s", type=float, default=1.0, help="Settle time after each reset")
-    parser.add_argument("--reset-dq-max", type=float, default=0.05, help="NRT reset max velocity without home plan")
-    parser.add_argument("--reset-ddq-max", type=float, default=0.10, help="NRT reset max acceleration without home plan")
-    parser.add_argument("--reset-timeout-s", type=float, default=45.0, help="NRT reset timeout")
-    parser.add_argument("--reset-tolerance-deg", type=float, default=5.0, help="Allowed reset error before torque trial")
+    parser.add_argument("--reset-dq-max", type=float, default=0.02, help="NRT reset max velocity without home plan")
+    parser.add_argument("--reset-ddq-max", type=float, default=0.04, help="NRT reset max acceleration without home plan")
+    parser.add_argument("--reset-timeout-s", type=float, default=240.0, help="NRT reset timeout")
+    parser.add_argument("--reset-tolerance-deg", type=float, default=0.5, help="Allowed reset error before torque trial")
     parser.add_argument("--rdk-prefix", default=None, help="CMAKE_PREFIX_PATH for a source-built Flexiv RDK install")
     parser.add_argument("--build-dir", default=None, help="CMake build directory")
     parser.add_argument("--no-build", action="store_true", help="Skip CMake configure/build")
@@ -80,8 +80,6 @@ def main() -> None:
         args.robot_sn,
         "--output-dir",
         str(output_dir),
-        "--home-plan",
-        args.home_plan,
         "--joints",
         args.joints,
         "--max-torque-nm",
@@ -109,6 +107,8 @@ def main() -> None:
     ]
     if args.joint_group:
         collect_cmd += ["--joint-group", args.joint_group]
+    if args.home_plan:
+        collect_cmd += ["--home-plan", args.home_plan]
     if args.home_zero:
         collect_cmd.append("--home-zero")
     if args.no_home_plan:
@@ -126,4 +126,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

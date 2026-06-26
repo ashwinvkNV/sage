@@ -41,7 +41,7 @@ struct Args {
     std::string robot_sn;
     std::string output_dir;
     std::string joint_group;
-    std::string home_plan = "PLAN-Home";
+    std::string home_plan;
     std::string joints = "all";
     double max_torque_nm = 0.5;
     double offset_limit_deg = 10.0;
@@ -50,10 +50,10 @@ struct Args {
     double trial_timeout_s = 8.0;
     double ramp_duration_s = 2.0;
     double settle_s = 1.0;
-    double reset_dq_max = 0.05;
-    double reset_ddq_max = 0.10;
-    double reset_timeout_s = 45.0;
-    double reset_tolerance_deg = 5.0;
+    double reset_dq_max = 0.02;
+    double reset_ddq_max = 0.04;
+    double reset_timeout_s = 240.0;
+    double reset_tolerance_deg = 0.5;
     bool enable_gravity_comp = true;
     bool enable_soft_limits = true;
     bool auto_start = false;
@@ -96,6 +96,7 @@ struct TrialSummary {
 
 struct TrialState {
     flexiv::rdk::Robot* robot = nullptr;
+    flexiv::rdk::JointGroup group;
     int trial_id = 0;
     int joint_index = 0;
     int sign = 0;
@@ -258,7 +259,7 @@ void PrintHelp()
         << "Safety defaults are intentionally conservative. Start tiny.\n\n"
         << "Options:\n"
         << "  --joint-group ARMS                 Flexiv joint group, default: first group\n"
-        << "  --home-plan PLAN-Home              Plan used before each torque trial, default: PLAN-Home\n"
+        << "  --home-plan PLAN-Home              Optional saved plan used before each torque trial\n"
         << "  --home-zero                        Move slowly to all-zero joints and use exact zero as home_q\n"
         << "  --no-home-plan                     Reset by slow NRT joint position to the recorded home pose\n"
         << "  --joints all|joint1,joint2|1,2     Joints to probe, default: all\n"
@@ -269,8 +270,10 @@ void PrintHelp()
         << "  --trial-timeout-s 8                Stop a trial after this duration\n"
         << "  --ramp-duration-s 2                Smooth half-cosine torque ramp duration\n"
         << "  --settle-s 1                       Settle time after reset\n"
-        << "  --reset-dq-max 0.05                NRT reset max velocity if --no-home-plan\n"
-        << "  --reset-ddq-max 0.10               NRT reset max acceleration if --no-home-plan\n"
+        << "  --reset-dq-max 0.02                NRT reset max velocity if --no-home-plan\n"
+        << "  --reset-ddq-max 0.04               NRT reset max acceleration if --no-home-plan\n"
+        << "  --reset-timeout-s 240              NRT reset timeout\n"
+        << "  --reset-tolerance-deg 0.5          Allowed reset error before torque trial\n"
         << "  --disable-gravity-comp             Send RtJointTorqueCmd with gravity compensation disabled\n"
         << "  --disable-soft-limits              Send RtJointTorqueCmd with soft limits disabled\n"
         << "  --auto-start                       Do not ask for interactive confirmation\n";
@@ -355,13 +358,30 @@ Args ParseArgs(int argc, char* argv[])
     return out;
 }
 
-std::string ResolveGroupName(const std::string& requested)
+flexiv::rdk::JointGroup ResolveGroup(flexiv::rdk::Robot& robot, const std::string& requested)
 {
-    if (requested.empty() || Upper(requested) == "ARMS" || Upper(requested) == "FULL_SYSTEM") {
-        return requested.empty() ? "ARMS" : requested;
+    const auto groups = robot.groups();
+    if (groups.empty()) {
+        throw std::runtime_error("Robot reported no joint groups");
     }
-    throw std::invalid_argument(
-        "RDK v1.8 torque collector uses full-system joints only; use --joint-group ARMS");
+    if (requested.empty()) {
+        return groups.front();
+    }
+
+    const auto requested_upper = Upper(requested);
+    for (const auto& group : groups) {
+        const auto name = flexiv::rdk::kJointGroupNames.at(group);
+        if (Upper(name) == requested_upper) {
+            return group;
+        }
+    }
+
+    std::ostringstream msg;
+    msg << "Joint group '" << requested << "' not found. Available groups:";
+    for (const auto& group : groups) {
+        msg << " " << flexiv::rdk::kJointGroupNames.at(group);
+    }
+    throw std::runtime_error(msg.str());
 }
 
 std::vector<int> ResolveJointIndices(const std::string& spec, size_t dof)
@@ -395,7 +415,10 @@ std::vector<int> ResolveJointIndices(const std::string& spec, size_t dof)
 void StreamZeroTorque(TrialState& state)
 {
     std::vector<double> zero(state.dof, 0.0);
-    state.robot->StreamJointTorque(zero, state.enable_gravity_comp, state.enable_soft_limits);
+    std::map<flexiv::rdk::JointGroup, flexiv::rdk::RtJointTorqueCmd> cmds;
+    cmds[state.group] =
+        flexiv::rdk::RtJointTorqueCmd(zero, state.enable_gravity_comp, state.enable_soft_limits);
+    state.robot->StreamJointTorque(cmds);
 }
 
 void RequestStop(TrialState& state, const std::string& reason)
@@ -432,7 +455,13 @@ void TorquePeriodicTask(TrialState& state)
 
         const double time_s = SecondsSince(state.run_start);
         const double trial_time_s = SecondsSince(state.trial_start);
-        const auto robot_states = state.robot->states();
+        const auto all_states = state.robot->states();
+        const auto states_it = all_states.find(state.group);
+        if (states_it == all_states.end()) {
+            RequestStop(state, "missing_joint_group_state");
+            return;
+        }
+        const auto& robot_states = states_it->second;
         if (robot_states.q.size() != state.dof || robot_states.dq.size() != state.dof) {
             RequestStop(state, "state_size_mismatch");
             return;
@@ -469,8 +498,10 @@ void TorquePeriodicTask(TrialState& state)
         command_torque[state.joint_index] =
             state.sign * state.max_torque_nm * SmoothRamp(trial_time_s, state.ramp_duration_s);
 
-        state.robot->StreamJointTorque(
+        std::map<flexiv::rdk::JointGroup, flexiv::rdk::RtJointTorqueCmd> cmds;
+        cmds[state.group] = flexiv::rdk::RtJointTorqueCmd(
             command_torque, state.enable_gravity_comp, state.enable_soft_limits);
+        state.robot->StreamJointTorque(cmds);
 
         Sample sample;
         sample.trial_id = state.trial_id;
@@ -495,9 +526,14 @@ void TorquePeriodicTask(TrialState& state)
     }
 }
 
-std::vector<double> ReadGroupPosition(flexiv::rdk::Robot& robot)
+std::vector<double> ReadGroupPosition(flexiv::rdk::Robot& robot, flexiv::rdk::JointGroup group)
 {
-    return robot.states().q;
+    const auto states = robot.states();
+    const auto it = states.find(group);
+    if (it == states.end()) {
+        throw std::runtime_error("Could not read selected joint group state");
+    }
+    return it->second.q;
 }
 
 void WaitUntilNotBusy(flexiv::rdk::Robot& robot)
@@ -510,7 +546,8 @@ void WaitUntilNotBusy(flexiv::rdk::Robot& robot)
     }
 }
 
-void ResetToHome(flexiv::rdk::Robot& robot, const Args& args, const std::vector<double>& home_q)
+void ResetToHome(flexiv::rdk::Robot& robot, flexiv::rdk::JointGroup group, const Args& args,
+    const std::vector<double>& home_q)
 {
     if (!args.home_plan.empty()) {
         std::cout << "[Flexiv RT Torque] Executing reset plan: " << args.home_plan << std::endl;
@@ -524,7 +561,9 @@ void ResetToHome(flexiv::rdk::Robot& robot, const Args& args, const std::vector<
         std::vector<double> zero(home_q.size(), 0.0);
         std::vector<double> dq_max(home_q.size(), args.reset_dq_max);
         std::vector<double> ddq_max(home_q.size(), args.reset_ddq_max);
-        robot.SendJointPosition(home_q, zero, dq_max, ddq_max);
+        std::map<flexiv::rdk::JointGroup, flexiv::rdk::NrtJointPositionCmd> cmds;
+        cmds[group] = flexiv::rdk::NrtJointPositionCmd(home_q, zero, dq_max, ddq_max);
+        robot.SendJointPosition(cmds);
 
         const auto start = Clock::now();
         const double tolerance_rad = DegToRad(args.reset_tolerance_deg);
@@ -532,7 +571,7 @@ void ResetToHome(flexiv::rdk::Robot& robot, const Args& args, const std::vector<
             if (g_user_stop) {
                 throw std::runtime_error("User stop requested during NRT reset");
             }
-            const auto q = ReadGroupPosition(robot);
+            const auto q = ReadGroupPosition(robot, group);
             double max_error = 0.0;
             for (size_t i = 0; i < q.size() && i < home_q.size(); ++i) {
                 max_error = std::max(max_error, std::abs(q[i] - home_q[i]));
@@ -549,9 +588,9 @@ void ResetToHome(flexiv::rdk::Robot& robot, const Args& args, const std::vector<
     }
 }
 
-TrialSummary RunTrial(flexiv::rdk::Robot& robot, const Args& args, const std::vector<double>& home_q,
-    int trial_id, int joint_index, int sign, const Clock::time_point& run_start,
-    std::vector<Sample>& all_samples)
+TrialSummary RunTrial(flexiv::rdk::Robot& robot, flexiv::rdk::JointGroup group, const Args& args,
+    const std::vector<double>& home_q, int trial_id, int joint_index, int sign,
+    const Clock::time_point& run_start, std::vector<Sample>& all_samples)
 {
     std::cout << "[Flexiv RT Torque] Trial " << trial_id << ": " << JointName(joint_index)
               << (sign > 0 ? " positive" : " negative") << " torque" << std::endl;
@@ -560,6 +599,7 @@ TrialSummary RunTrial(flexiv::rdk::Robot& robot, const Args& args, const std::ve
 
     TrialState state;
     state.robot = &robot;
+    state.group = group;
     state.trial_id = trial_id;
     state.joint_index = joint_index;
     state.sign = sign;
@@ -735,9 +775,10 @@ void WriteMetadataJson(const fs::path& out_dir, const Args& args, const std::str
 }
 
 void ValidateResetPosition(
-    flexiv::rdk::Robot& robot, const Args& args, const std::vector<double>& home_q)
+    flexiv::rdk::Robot& robot, flexiv::rdk::JointGroup group, const Args& args,
+    const std::vector<double>& home_q)
 {
-    const auto q = ReadGroupPosition(robot);
+    const auto q = ReadGroupPosition(robot, group);
     double max_offset = 0.0;
     for (size_t i = 0; i < q.size(); ++i) {
         max_offset = std::max(max_offset, std::abs(q[i] - home_q[i]));
@@ -801,27 +842,27 @@ int main(int argc, char* argv[])
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
-        const auto group_name = ResolveGroupName(args.joint_group);
-        std::cout << "[Flexiv RT Torque] Using RDK v1.8 full-system joint API as group: "
-                  << group_name << std::endl;
+        const auto group = ResolveGroup(robot, args.joint_group);
+        const auto group_name = flexiv::rdk::kJointGroupNames.at(group);
+        std::cout << "[Flexiv RT Torque] Using joint group: " << group_name << std::endl;
 
         std::vector<double> home_q;
         if (!args.home_plan.empty()) {
-            ResetToHome(robot, args, {});
-            home_q = ReadGroupPosition(robot);
+            ResetToHome(robot, group, args, {});
+            home_q = ReadGroupPosition(robot, group);
         } else if (args.home_zero) {
-            const auto current_q = ReadGroupPosition(robot);
+            const auto current_q = ReadGroupPosition(robot, group);
             home_q.assign(current_q.size(), 0.0);
             std::cout << "[Flexiv RT Torque] Moving slowly to all-zero joint home with "
                          "NRT_JOINT_POSITION"
                       << std::endl;
-            ResetToHome(robot, args, home_q);
-            ValidateResetPosition(robot, args, home_q);
+            ResetToHome(robot, group, args, home_q);
+            ValidateResetPosition(robot, group, args, home_q);
             std::cout << "[Flexiv RT Torque] Using exact all-zero vector as home_q" << std::endl;
         } else {
             std::cout << "[Flexiv RT Torque] No home plan configured; using current pose as home"
                       << std::endl;
-            home_q = ReadGroupPosition(robot);
+            home_q = ReadGroupPosition(robot, group);
         }
         const auto joints = ResolveJointIndices(args.joints, home_q.size());
         std::cout << "[Flexiv RT Torque] Recorded home q: " << VecToList(home_q) << std::endl;
@@ -840,14 +881,14 @@ int main(int argc, char* argv[])
                 if (g_user_stop) {
                     throw std::runtime_error("User stop requested before next trial");
                 }
-                ResetToHome(robot, args, home_q);
-                ValidateResetPosition(robot, args, home_q);
+                ResetToHome(robot, group, args, home_q);
+                ValidateResetPosition(robot, group, args, home_q);
                 const double start_s = SecondsSince(run_start);
                 events.push_back(
                     {start_s, "TRIAL_START_" + JointName(joint_index) + (sign > 0 ? "_pos" : "_neg")});
                 auto summary =
-                    RunTrial(robot, args, home_q, ++trial_id, joint_index, sign, run_start,
-                        all_samples);
+                    RunTrial(robot, group, args, home_q, ++trial_id, joint_index, sign,
+                        run_start, all_samples);
                 summaries.push_back(summary);
                 events.push_back({summary.end_s,
                     "TRIAL_END_" + JointName(joint_index) + (sign > 0 ? "_pos_" : "_neg_")
