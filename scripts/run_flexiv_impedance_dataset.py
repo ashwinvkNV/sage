@@ -469,6 +469,10 @@ def write_manifest(
         "joint_names": joint_names,
         "base": base,
         "intended_controller": "Flexiv NRT_JOINT_IMPEDANCE",
+        "command_velocity_limit_rad_s": args.max_velocity,
+        "command_acceleration_limit_rad_s2": args.max_acceleration,
+        "start_move_velocity_limit_rad_s": args.start_max_velocity,
+        "start_move_acceleration_limit_rad_s2": args.start_max_acceleration,
         "stiffness_scales": args.stiffness_scales,
         "damping_ratios": args.damping_ratios,
         "repeats": args.repeats,
@@ -531,8 +535,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-move-duration", type=float, default=30.0)
     parser.add_argument("--start-max-velocity", type=float, default=0.03)
     parser.add_argument("--start-max-acceleration", type=float, default=0.05)
-    parser.add_argument("--max-velocity", type=float, default=0.20)
-    parser.add_argument("--max-acceleration", type=float, default=0.50)
+    parser.add_argument(
+        "--max-velocity",
+        "--command-velocity-limit",
+        dest="max_velocity",
+        type=float,
+        default=2.0,
+        help="Flexiv SendJointPosition dq_max during command-response motions, in rad/s.",
+    )
+    parser.add_argument(
+        "--max-acceleration",
+        "--command-acceleration-limit",
+        dest="max_acceleration",
+        type=float,
+        default=3.0,
+        help="Flexiv SendJointPosition ddq_max during command-response motions, in rad/s^2.",
+    )
     parser.add_argument("--max-initial-diff-rad", type=float, default=0.5)
     parser.add_argument("--auto-start", action="store_true")
     parser.add_argument("--flexiv-dry-run", action="store_true")

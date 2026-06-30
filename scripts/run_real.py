@@ -42,8 +42,8 @@ def run_motion(
     flexiv_dry_run=False,
     flexiv_control_freq=50,
     flexiv_slowdown_factor=1.0,
-    flexiv_max_velocity=0.05,
-    flexiv_max_acceleration=0.1,
+    flexiv_max_velocity=2.0,
+    flexiv_max_acceleration=3.0,
     flexiv_home_plan=None,
     flexiv_start_move_duration=20.0,
     flexiv_start_max_velocity=0.03,
@@ -205,13 +205,13 @@ Examples:
     parser.add_argument(
         "--flexiv-max-velocity",
         type=parse_motion_limit,
-        default=0.05,
+        default=2.0,
         help="Flexiv SendJointPosition dq_max per joint in rad/s. Use 'inf' for robot dq_max.",
     )
     parser.add_argument(
         "--flexiv-max-acceleration",
         type=parse_motion_limit,
-        default=0.1,
+        default=3.0,
         help="Flexiv SendJointPosition ddq_max per joint in rad/s^2. Use 'inf' for aggressive limits.",
     )
     parser.add_argument(

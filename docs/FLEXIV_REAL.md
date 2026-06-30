@@ -98,8 +98,8 @@ python scripts/run_real.py \
   --flexiv-start-move-duration 30 \
   --flexiv-start-max-velocity 0.02 \
   --flexiv-start-max-acceleration 0.03 \
-  --flexiv-max-velocity 0.03 \
-  --flexiv-max-acceleration 0.05 \
+  --flexiv-max-velocity 2.0 \
+  --flexiv-max-acceleration 3.0 \
   --flexiv-motion-scale 0.1 \
   --flexiv-max-initial-diff-rad 0.5
 ```
@@ -133,8 +133,8 @@ python scripts/run_real.py \
   --flexiv-start-move-duration 30 \
   --flexiv-start-max-velocity 0.02 \
   --flexiv-start-max-acceleration 0.03 \
-  --flexiv-max-velocity 0.03 \
-  --flexiv-max-acceleration 0.05 \
+  --flexiv-max-velocity 2.0 \
+  --flexiv-max-acceleration 3.0 \
   --flexiv-motion-scale 0.1 \
   --flexiv-max-initial-diff-rad 0.5
 ```
@@ -236,7 +236,9 @@ python scripts/run_flexiv_impedance_dataset.py \
   --joint-group ARMS \
   --home-zero-first \
   --stiffness-scales 0.75 \
-  --damping-ratios 0.7
+  --damping-ratios 0.7 \
+  --command-velocity-limit 2.0 \
+  --command-acceleration-limit 3.0
 ```
 
 If you want the learned model to condition on different Flexiv impedance
@@ -250,8 +252,16 @@ python scripts/run_flexiv_impedance_dataset.py \
   --joint-group ARMS \
   --home-zero-first \
   --stiffness-scales 0.5 0.75 1.0 \
-  --damping-ratios 0.5 0.7
+  --damping-ratios 0.5 0.7 \
+  --command-velocity-limit 2.0 \
+  --command-acceleration-limit 3.0
 ```
+
+The impedance dataset wrapper defaults to `--command-velocity-limit 2.0` and
+`--command-acceleration-limit 3.0` for the actual command-response motions. The
+home move and move-to-first-waypoint remain conservative by default:
+`--home-max-velocity 0.02`, `--home-max-acceleration 0.04`,
+`--start-max-velocity 0.03`, and `--start-max-acceleration 0.05`.
 
 The generated motions live under:
 
