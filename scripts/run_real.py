@@ -14,7 +14,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-REST_PERIOD_SECONDS = 15
+REST_PERIOD_SECONDS = 2
 
 
 def parse_motion_limit(value):

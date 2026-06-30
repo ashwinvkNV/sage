@@ -501,7 +501,7 @@ def parse_args() -> argparse.Namespace:
         help="Root folder for generated motions. Defaults to motion_files/flexiv.",
     )
     parser.add_argument("--profile", choices=["smoke", "large"], default="large")
-    parser.add_argument("--control-freq", type=float, default=50.0)
+    parser.add_argument("--control-freq", type=int, default=50)
     parser.add_argument("--base-state-csv", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--prepare-only", action="store_true", help="Generate motion files but do not run the robot.")
